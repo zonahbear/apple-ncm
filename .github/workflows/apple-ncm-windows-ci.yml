@@ -33,10 +33,10 @@ jobs:
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $vs = & $vswhere -latest -products '*' -requires Microsoft.Component.MSBuild -property installationPath
           $setup = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
-          $args = @('modify', '--installPath', "`"$vs`"", '--quiet', '--wait', '--norestart',
+          $setupArguments = @('modify', '--installPath', "`"$vs`"", '--quiet', '--norestart',
             '--add', 'Microsoft.VisualStudio.Component.Windows.DriverKit',
             '--add', 'Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre')
-          $p = Start-Process $setup -ArgumentList $args -Wait -PassThru
+          $p = Start-Process $setup -ArgumentList $setupArguments -Wait -PassThru
           if ($p.ExitCode -notin 0,3010) { throw "VS setup failed: $($p.ExitCode)" }
           # Official Microsoft SDK/WDK 26100.6584 links, paired with VS 2022.
           $downloads = @(
