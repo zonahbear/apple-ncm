@@ -1,0 +1,148 @@
+name: Build Apple NCM for Windows
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/apple-ncm-windows-ci.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Fetch reviewed upstream source
+        uses: actions/checkout@v4
+        with:
+          repository: shrekoverflow/apple-ncm
+          ref: 36137d3a9c3c9866000488722e489c3a6c977243
+          persist-credentials: false
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Install driver development components
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.Component.MSBuild -property installationPath
+          $setup = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
+          $args = @('modify', '--installPath', "`"$vs`"", '--quiet', '--wait', '--norestart',
+            '--add', 'Microsoft.VisualStudio.Component.Windows.DriverKit',
+            '--add', 'Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre')
+          $p = Start-Process $setup -ArgumentList $args -Wait -PassThru
+          if ($p.ExitCode -notin 0,3010) { throw "VS setup failed: $($p.ExitCode)" }
+          # Official Microsoft SDK/WDK 26100.6584 links, paired with VS 2022.
+          $downloads = @(
+            @{ Name='sdk'; Url='https://go.microsoft.com/fwlink/?linkid=2338977' },
+            @{ Name='wdk'; Url='https://go.microsoft.com/fwlink/?linkid=2335869' }
+          )
+          foreach ($item in $downloads) {
+            $exe = Join-Path $env:RUNNER_TEMP ($item.Name + 'setup.exe')
+            Invoke-WebRequest $item.Url -OutFile $exe
+            $sig = Get-AuthenticodeSignature $exe
+            if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
+              throw "Invalid Microsoft installer signature: $exe"
+            }
+            $p = Start-Process $exe -ArgumentList '/quiet /norestart' -Wait -PassThru
+            if ($p.ExitCode -notin 0,3010) { throw "$($item.Name) install failed: $($p.ExitCode)" }
+          }
+          $kits = "${env:ProgramFiles(x86)}\Windows Kits\10"
+          if (-not (Test-Path "$kits\Include\10.0.26100.0\km\wdm.h")) {
+            throw 'WDK headers not found after setup'
+          }
+
+      - name: Build only the x64 host driver
+        run: |
+          New-Item -ItemType Directory -Force logs | Out-Null
+          Set-Location NCM-Driver-for-Windows
+          msbuild projects\host\host.vcxproj /t:Rebuild /m `
+            /p:Configuration=Debug /p:Platform=x64 `
+            /p:WindowsTargetPlatformVersion=10.0.26100.0 `
+            /p:SignMode=Off /bl:..\logs\build.binlog `
+            '/flp:logfile=..\logs\build.log;verbosity=normal'
+          if ($LASTEXITCODE -ne 0) { throw 'Driver build failed; inspect logs artifact' }
+
+      - name: Package and test-sign
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:GITHUB_WORKSPACE 'NCM-Driver-for-Windows'
+          $package = Join-Path $env:GITHUB_WORKSPACE 'package'
+          New-Item -ItemType Directory -Force $package | Out-Null
+          foreach ($name in 'UsbNcmSample.sys','UsbNcmSample.inf') {
+            $file = Get-ChildItem "$root\projects\host" -Recurse -File -Filter $name |
+              Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if (-not $file) { throw "Missing build output: $name" }
+            Copy-Item $file.FullName (Join-Path $package $name)
+          }
+          $kits = "${env:ProgramFiles(x86)}\Windows Kits\10\bin\10.0.26100.0"
+          $sign = Join-Path $kits 'x64\signtool.exe'
+          $cat = Join-Path $kits 'x86\Inf2Cat.exe'
+          if (-not (Test-Path $cat)) { $cat = Join-Path $kits 'x64\Inf2Cat.exe' }
+          if (-not (Test-Path $sign) -or -not (Test-Path $cat)) { throw 'Signing tools missing' }
+          $cert = New-SelfSignedCertificate -Type CodeSigningCert `
+            -Subject "CN=Apple NCM CI Test $env:GITHUB_RUN_ID" `
+            -CertStoreLocation Cert:\LocalMachine\My `
+            -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 `
+            -KeyExportPolicy NonExportable -NotAfter (Get-Date).AddYears(1)
+          Export-Certificate -Cert $cert -FilePath "$package\AppleNcmTest.cer" | Out-Null
+          Import-Certificate -FilePath "$package\AppleNcmTest.cer" -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
+          Import-Certificate -FilePath "$package\AppleNcmTest.cer" -CertStoreLocation Cert:\LocalMachine\TrustedPublisher | Out-Null
+          & $sign sign /sm /s My /sha1 $cert.Thumbprint /fd SHA256 "$package\UsbNcmSample.sys"
+          if ($LASTEXITCODE -ne 0) { throw 'SYS signing failed' }
+          & $cat "/driver:$package" /os:10_X64 /uselocaltime
+          if ($LASTEXITCODE -ne 0) { throw 'Catalog generation failed' }
+          & $sign sign /sm /s My /sha1 $cert.Thumbprint /fd SHA256 "$package\UsbNcmSample.cat"
+          if ($LASTEXITCODE -ne 0) { throw 'Catalog signing failed' }
+          foreach ($file in 'UsbNcmSample.sys','UsbNcmSample.cat') {
+            & $sign verify /pa /v (Join-Path $package $file)
+            if ($LASTEXITCODE -ne 0) { throw "Signature verification failed: $file" }
+          }
+          Copy-Item NCM-Driver-for-Windows\LICENSE $package
+          @"
+          Experimental Apple NCM host driver for Windows x64.
+          Source: shrekoverflow/apple-ncm@36137d3a9c3c9866000488722e489c3a6c977243
+          Build run: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID
+          Certificate SHA1 thumbprint: $($cert.Thumbprint)
+          This package is test-signed, not Microsoft production-signed.
+          The private signing key is non-exportable and is not included.
+          Hardware operation and Memory Integrity compatibility are untested.
+
+          Install from Administrator PowerShell after extracting the ZIP:
+          Import-Certificate -FilePath .\AppleNcmTest.cer -CertStoreLocation Cert:\LocalMachine\Root
+          Import-Certificate -FilePath .\AppleNcmTest.cer -CertStoreLocation Cert:\LocalMachine\TrustedPublisher
+          bcdedit /set testsigning on
+          Restart Windows before installing the driver. Secure Boot blocks test mode;
+          have the BitLocker recovery key before changing Secure Boot settings.
+          pnputil /add-driver .\UsbNcmSample.inf /install
+
+          If Windows retains its composite driver, manually choose this INF for the
+          USB parent with hardware ID USB\VID_05AC&PID_1905 (no MI_XX suffix).
+          Do not install the function-driver sample.
+          "@ | Set-Content "$package\README.txt"
+          Get-ChildItem $package -File | Get-FileHash -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash)  $([IO.Path]::GetFileName($_.Path))" } |
+            Set-Content "$package\SHA256SUMS.txt"
+
+      - name: Upload driver package
+        uses: actions/upload-artifact@v4
+        with:
+          name: apple-ncm-windows-x64-test-signed
+          path: package/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apple-ncm-build-logs
+          path: logs/
+          if-no-files-found: warn
+          retention-days: 14
