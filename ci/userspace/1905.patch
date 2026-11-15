@@ -1,0 +1,485 @@
+diff --git a/package-interfaces/AppleMacUsbNcm-WinUSB-Interfaces.inf b/package-interfaces/AppleMacUsbNcm-WinUSB-Interfaces.inf
+index 2039b00..ae15d49 100644
+--- a/package-interfaces/AppleMacUsbNcm-WinUSB-Interfaces.inf
++++ b/package-interfaces/AppleMacUsbNcm-WinUSB-Interfaces.inf
+@@ -3,7 +3,8 @@
+ ;
+ ; Experimental WinUSB binding package for user-mode CDC NCM validation.
+ ;
+-; This package binds the first Apple NCM control/data interface pair to WinUSB:
++; This package binds only the Apple 05AC:1905 MI_00/MI_01 pair to WinUSB.
++; The composite parent must remain bound to usbccgp:
+ ;
+ ;   MI_00: CDC NCM control interface
+ ;   MI_01: CDC NCM data interface
+@@ -26,8 +27,8 @@ PnpLockdown = 1
+ %ProviderName% = AppleNcmModels,NTamd64.10.0...26100
+ 
+ [AppleNcmModels.NTamd64.10.0...26100]
+-%AppleNcm.ControlDesc% = AppleNcm_Control_Install, USB\VID_05AC&PID_1902&MI_00
+-%AppleNcm.DataDesc%    = AppleNcm_Data_Install,    USB\VID_05AC&PID_1902&MI_01
++%AppleNcm.ControlDesc% = AppleNcm_Control_Install, USB\VID_05AC&PID_1905&MI_00
++%AppleNcm.DataDesc%    = AppleNcm_Data_Install,    USB\VID_05AC&PID_1905&MI_01
+ 
+ [AppleNcm_Control_Install.NT]
+ Include = winusb.inf
+diff --git a/usermode-probe/build.ps1 b/usermode-probe/build.ps1
+index c613d02..467fc5a 100644
+--- a/usermode-probe/build.ps1
++++ b/usermode-probe/build.ps1
+@@ -67,7 +67,7 @@ Write-Section 'Build inputs'
+ } | Format-List
+ 
+ $quotedSources = ($sourceFiles | ForEach-Object { '"{0}"' -f $_ }) -join ' '
+-$compileCommand = 'call "{0}" -arch={1} -host_arch=x64 >nul && cl.exe /nologo /std:c++17 /EHsc /W4 /permissive- /DUNICODE /D_UNICODE /D_WIN32_WINNT=0x0A00 /Fo"{2}\\" /Fe"{3}" {4} setupapi.lib winusb.lib advapi32.lib /link /INCREMENTAL:NO' -f `
++$compileCommand = 'call "{0}" -arch={1} -host_arch=x64 >nul && cl.exe /nologo /std:c++17 /EHsc /MT /W4 /permissive- /DUNICODE /D_UNICODE /D_WIN32_WINNT=0x0A00 /Fo"{2}\\" /Fe"{3}" {4} setupapi.lib cfgmgr32.lib winusb.lib advapi32.lib /link /INCREMENTAL:NO' -f `
+     $vsDevCmd,
+     $Arch,
+     $outDir,
+diff --git a/usermode-probe/common.h b/usermode-probe/common.h
+index 2916c89..ca599f8 100644
+--- a/usermode-probe/common.h
++++ b/usermode-probe/common.h
+@@ -68,6 +68,7 @@ struct PacketFilterState {
+ };
+ 
+ struct Options {
++    bool listDevices = false;
+     bool setDataAlt1 = true;
+     bool readOnce = false;
+     bool writeOnce = false;
+diff --git a/usermode-probe/device_selection.h b/usermode-probe/device_selection.h
+new file mode 100644
+index 0000000..d5a7fb8
+--- /dev/null
++++ b/usermode-probe/device_selection.h
+@@ -0,0 +1,77 @@
++#pragma once
++
++#include <set>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++// PnP metadata, rather than symbolic-link ordering, establishes physical identity.
++struct NcmInterfaceCandidate {
++    std::wstring path;
++    std::wstring instanceId;
++    std::wstring parentInstanceId;
++};
++
++struct NcmInterfacePair {
++    NcmInterfaceCandidate control;
++    NcmInterfaceCandidate data;
++};
++
++inline std::wstring CanonicalUsbId(std::wstring value)
++{
++    for (auto& ch : value) {
++        if (ch >= L'a' && ch <= L'z') {
++            ch = static_cast<wchar_t>(ch - L'a' + L'A');
++        }
++    }
++    return value;
++}
++
++inline bool HasUsbInstancePrefix(const std::wstring& instanceId, const std::wstring& prefix)
++{
++    const auto canonical = CanonicalUsbId(instanceId);
++    return canonical.size() > prefix.size() && canonical.compare(0, prefix.size(), prefix) == 0;
++}
++
++inline bool IsTargetNcmInterface(const NcmInterfaceCandidate& candidate, bool control)
++{
++    return !candidate.path.empty() &&
++        HasUsbInstancePrefix(candidate.instanceId, control ?
++            L"USB\\VID_05AC&PID_1905&MI_00\\" : L"USB\\VID_05AC&PID_1905&MI_01\\") &&
++        HasUsbInstancePrefix(candidate.parentInstanceId, L"USB\\VID_05AC&PID_1905\\");
++}
++
++inline NcmInterfacePair SelectTargetNcmPair(
++    const std::vector<NcmInterfaceCandidate>& controls,
++    const std::vector<NcmInterfaceCandidate>& data)
++{
++    std::vector<NcmInterfaceCandidate> matchingControls;
++    std::vector<NcmInterfaceCandidate> matchingData;
++    std::set<std::wstring> parents;
++    for (const auto& candidate : controls) {
++        if (IsTargetNcmInterface(candidate, true)) {
++            matchingControls.push_back(candidate);
++            parents.insert(CanonicalUsbId(candidate.parentInstanceId));
++        }
++    }
++    for (const auto& candidate : data) {
++        if (IsTargetNcmInterface(candidate, false)) {
++            matchingData.push_back(candidate);
++            parents.insert(CanonicalUsbId(candidate.parentInstanceId));
++        }
++    }
++    if (parents.size() > 1) {
++        throw std::runtime_error(
++            "Multiple Apple 05AC:1905 USB instances found; control/data must share one composite parent. "
++            "Disconnect the other Macs and retry.");
++    }
++    if (matchingControls.empty() || matchingData.empty()) {
++        throw std::runtime_error(
++            "No complete Apple 05AC:1905 WinUSB pair found. Install WinUSB on MI_00 (control) "
++            "and MI_01 (data), leaving the composite parent on usbccgp, then reconnect both cable ends.");
++    }
++    if (matchingControls.size() != 1 || matchingData.size() != 1) {
++        throw std::runtime_error("Ambiguous Apple 05AC:1905 interface paths; refusing to choose the first path.");
++    }
++    return { matchingControls.front(), matchingData.front() };
++}
+diff --git a/usermode-probe/ncm_probe.cpp b/usermode-probe/ncm_probe.cpp
+index e58fa76..0ed677a 100644
+--- a/usermode-probe/ncm_probe.cpp
++++ b/usermode-probe/ncm_probe.cpp
+@@ -9,7 +9,7 @@
+ static void PrintUsage()
+ {
+     std::wcout
+-        << L"ncm_probe [--no-set-alt1] [--read-once] [--read-timeout-ms N]\n"
++        << L"ncm_probe [--list-devices] [--no-set-alt1] [--read-once] [--read-timeout-ms N]\n"
+         << L"          [--write-once] [--write-timeout-ms N]\n"
+         << L"          [--loop-seconds N] [--loop-write-interval-ms N]\n"
+         << L"          [--overlapped-loop-seconds N] [--overlapped-write-interval-ms N]\n"
+@@ -17,6 +17,8 @@ static void PrintUsage()
+         << L"          [--promiscuous]\n"
+         << L"          [--tap-probe] [--tap-set-media-connected]\n"
+         << L"\n"
++        << L"--list-devices validates the unique Apple 05AC:1905 MI_00/MI_01 pair\n"
++        << L"without opening USB handles or changing configuration.\n"
+         << L"Default behavior opens the WinUSB control/data interfaces, scans CDC NCM\n"
+         << L"functional descriptors, prints Mac-side MAC/MTU metadata, configures the\n"
+         << L"NCM NTB format, and sets data alternate setting 1.\n";
+@@ -32,7 +34,10 @@ static Options ParseOptions(int argc, wchar_t** argv)
+             std::wcout.flush();
+             ExitProcess(0);
+         }
+-        if (arg == L"--no-set-alt1") {
++        if (arg == L"--list-devices") {
++            options.listDevices = true;
++        }
++        else if (arg == L"--no-set-alt1") {
+             options.setDataAlt1 = false;
+         }
+         else if (arg == L"--read-once") {
+@@ -113,6 +118,9 @@ static Options ParseOptions(int argc, wchar_t** argv)
+         }
+     }
+ 
++    if (options.listDevices && argc != 2) {
++        throw std::runtime_error("--list-devices must be used alone");
++    }
+     if (options.loop && options.loopSeconds == 0) {
+         throw std::runtime_error("--loop-seconds must be greater than zero");
+     }
+@@ -146,12 +154,16 @@ int wmain(int argc, wchar_t** argv)
+ {
+     try {
+         Options options = ParseOptions(argc, argv);
++        if (options.listDevices) {
++            WinUsbNcmDevice::ListDevices();
++            return 0;
++        }
+         if (options.bridge && !SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE)) {
+             ThrowLastError("SetConsoleCtrlHandler");
+         }
+ 
+         std::wcout << L"=== WinUSB user-mode NCM probe ===\n";
+-        WinUsbNcmDevice device = WinUsbNcmDevice::OpenFirst();
++        WinUsbNcmDevice device = WinUsbNcmDevice::OpenTarget();
+         device.InspectAndConfigure(options);
+         device.RunRequestedActions(options);
+ 
+diff --git a/usermode-probe/test-codec.ps1 b/usermode-probe/test-codec.ps1
+index 29919e1..9c12f5e 100644
+--- a/usermode-probe/test-codec.ps1
++++ b/usermode-probe/test-codec.ps1
+@@ -64,7 +64,7 @@ Write-Section 'Codec self-test inputs'
+ } | Format-List
+ 
+ $quotedSources = ($sourceFiles | ForEach-Object { '"{0}"' -f $_ }) -join ' '
+-$compileCommand = 'call "{0}" -arch={1} -host_arch=x64 >nul && cl.exe /nologo /std:c++17 /EHsc /W4 /permissive- /DUNICODE /D_UNICODE /D_WIN32_WINNT=0x0A00 /I"{2}" /Fo"{3}\\" /Fe"{4}" {5} /link /INCREMENTAL:NO' -f `
++$compileCommand = 'call "{0}" -arch={1} -host_arch=x64 >nul && cl.exe /nologo /std:c++17 /EHsc /MT /W4 /permissive- /DUNICODE /D_UNICODE /D_WIN32_WINNT=0x0A00 /I"{2}" /Fo"{3}\\" /Fe"{4}" {5} /link /INCREMENTAL:NO' -f `
+     $vsDevCmd,
+     $Arch,
+     $scriptRoot,
+@@ -84,3 +84,19 @@ if ($LASTEXITCODE -ne 0) {
+     throw ('codec self-test failed with exit code {0}' -f $LASTEXITCODE)
+ }
+ Write-Host 'codec self-test passed'
++
++Write-Section 'Compile device selection self-test'
++$selectionSource = Join-Path $scriptRoot 'tests\device_selection_selftest.cpp'
++$selectionExe = Join-Path $outDir 'device_selection_selftest.exe'
++$selectionCompileCommand = 'call "{0}" -arch={1} -host_arch=x64 >nul && cl.exe /nologo /std:c++17 /EHsc /MT /W4 /permissive- /I"{2}" /Fo"{3}\\" /Fe"{4}" "{5}" /link /INCREMENTAL:NO' -f `
++    $vsDevCmd, $Arch, $scriptRoot, $outDir, $selectionExe, $selectionSource
++& cmd.exe /d /s /c $selectionCompileCommand
++if ($LASTEXITCODE -ne 0) {
++    throw ('device selection self-test compile failed with exit code {0}' -f $LASTEXITCODE)
++}
++
++Write-Section 'Run device selection self-test'
++& $selectionExe
++if ($LASTEXITCODE -ne 0) {
++    throw ('device selection self-test failed with exit code {0}' -f $LASTEXITCODE)
++}
+diff --git a/usermode-probe/tests/device_selection_selftest.cpp b/usermode-probe/tests/device_selection_selftest.cpp
+new file mode 100644
+index 0000000..07d318b
+--- /dev/null
++++ b/usermode-probe/tests/device_selection_selftest.cpp
+@@ -0,0 +1,76 @@
++#include "device_selection.h"
++
++#include <iostream>
++#include <utility>
++
++static NcmInterfaceCandidate Candidate(bool control, const std::wstring& serial = L"MAC_A")
++{
++    return {
++        control ? L"control-path" : L"data-path",
++        std::wstring(L"USB\\VID_05AC&PID_1905&MI_") + (control ? L"00" : L"01") + L"\\CHILD",
++        L"USB\\VID_05AC&PID_1905\\" + serial,
++    };
++}
++
++static void Check(bool condition, const char* message)
++{
++    if (!condition) {
++        throw std::runtime_error(message);
++    }
++}
++
++template <typename F>
++static void Reject(F test, const char* message)
++{
++    bool rejected = false;
++    try {
++        test();
++    }
++    catch (const std::runtime_error&) {
++        rejected = true;
++    }
++    Check(rejected, message);
++}
++
++int main()
++{
++    const auto control = Candidate(true);
++    const auto data = Candidate(false);
++    auto pair = SelectTargetNcmPair({control}, {data});
++    Check(pair.control.path == L"control-path" && pair.data.path == L"data-path", "valid pair failed");
++
++    auto lowercase = data;
++    lowercase.instanceId = L"usb\\vid_05ac&pid_1905&mi_01\\child";
++    lowercase.parentInstanceId = L"usb\\vid_05ac&pid_1905\\mac_a";
++    SelectTargetNcmPair({control}, {lowercase});
++
++    auto otherPid = control;
++    otherPid.instanceId = L"USB\\VID_05AC&PID_1902&MI_00\\CHILD";
++    otherPid.path = L"wrong-first-path";
++    pair = SelectTargetNcmPair({otherPid, control}, {data});
++    Check(pair.control.path == control.path, "foreign PID was selected");
++    Reject([&] { SelectTargetNcmPair({otherPid}, {data}); }, "foreign PID accepted");
++    Reject([&] { SelectTargetNcmPair({control}, {Candidate(false, L"MAC_B")}); }, "mixed parents accepted");
++    Reject([&] { SelectTargetNcmPair({control, Candidate(true, L"MAC_B")}, {data}); }, "partial second Mac ignored");
++    Reject([&] { SelectTargetNcmPair({control, control}, {data}); }, "duplicate control paths accepted");
++    Reject([&] { SelectTargetNcmPair({control}, {data, data}); }, "duplicate data paths accepted");
++    Reject([&] { SelectTargetNcmPair({}, {}); }, "empty enumeration accepted");
++    Reject([&] { SelectTargetNcmPair({control}, {}); }, "missing data accepted");
++    Reject([&] { SelectTargetNcmPair({data}, {control}); }, "wrong MI roles accepted");
++
++    auto spoof = control;
++    spoof.instanceId = L"USB\\VID_05AC&PID_1905&MI_000\\CHILD";
++    Reject([&] { SelectTargetNcmPair({spoof}, {data}); }, "interface prefix collision accepted");
++    spoof = control;
++    spoof.parentInstanceId = L"USB\\VID_05AC&PID_1905&MI_00\\MAC_A";
++    Reject([&] { SelectTargetNcmPair({spoof}, {data}); }, "non-composite parent accepted");
++    spoof = control;
++    spoof.parentInstanceId = L"USB\\VID_05AC&PID_1905\\";
++    Reject([&] { SelectTargetNcmPair({spoof}, {data}); }, "empty parent instance accepted");
++    spoof = control;
++    spoof.path.clear();
++    Reject([&] { SelectTargetNcmPair({spoof}, {data}); }, "empty device path accepted");
++
++    std::cout << "device selection self-test passed\n";
++    return 0;
++}
+diff --git a/usermode-probe/winusb_session.cpp b/usermode-probe/winusb_session.cpp
+index 87d2b8e..904c664 100644
+--- a/usermode-probe/winusb_session.cpp
++++ b/usermode-probe/winusb_session.cpp
+@@ -1,9 +1,11 @@
+ #include "winusb_session.h"
++#include "device_selection.h"
+ 
+ #include "bridge_loop.h"
+ #include "tap_adapter.h"
+ 
+ #include <setupapi.h>
++#include <cfgmgr32.h>
+ 
+ #include <algorithm>
+ #include <iomanip>
+@@ -60,7 +62,22 @@ struct EcmFunctionalDescriptor {
+ 
+ static_assert(sizeof(EcmFunctionalDescriptor) == 13, "Unexpected ECM functional descriptor layout");
+ 
+-static std::vector<std::wstring> EnumerateDevicePaths(const GUID& interfaceGuid)
++static std::wstring DeviceInstanceId(DEVINST devInst)
++{
++    ULONG length = 0;
++    CONFIGRET result = CM_Get_Device_ID_Size(&length, devInst, 0);
++    if (result != CR_SUCCESS) {
++        throw std::runtime_error("CM_Get_Device_ID_Size failed: " + std::to_string(result));
++    }
++    std::vector<wchar_t> buffer(static_cast<size_t>(length) + 1);
++    result = CM_Get_Device_IDW(devInst, buffer.data(), static_cast<ULONG>(buffer.size()), 0);
++    if (result != CR_SUCCESS) {
++        throw std::runtime_error("CM_Get_Device_IDW failed: " + std::to_string(result));
++    }
++    return buffer.data();
++}
++
++static std::vector<NcmInterfaceCandidate> EnumerateDevicePaths(const GUID& interfaceGuid)
+ {
+     HDEVINFO deviceInfoSet = SetupDiGetClassDevsW(
+         &interfaceGuid,
+@@ -71,7 +88,7 @@ static std::vector<std::wstring> EnumerateDevicePaths(const GUID& interfaceGuid)
+         ThrowLastError("SetupDiGetClassDevsW");
+     }
+ 
+-    std::vector<std::wstring> paths;
++    std::vector<NcmInterfaceCandidate> paths;
+     for (DWORD index = 0;; ++index) {
+         SP_DEVICE_INTERFACE_DATA interfaceData = {};
+         interfaceData.cbSize = sizeof(interfaceData);
+@@ -116,7 +133,19 @@ static std::vector<std::wstring> EnumerateDevicePaths(const GUID& interfaceGuid)
+             ThrowLastError("SetupDiGetDeviceInterfaceDetailW");
+         }
+ 
+-        paths.emplace_back(detailData->DevicePath);
++        try {
++            DEVINST parent = 0;
++            CONFIGRET result = CM_Get_Parent(&parent, devInfoData.DevInst, 0);
++            if (result != CR_SUCCESS) {
++                throw std::runtime_error("CM_Get_Parent failed: " + std::to_string(result));
++            }
++            paths.push_back({ detailData->DevicePath,
++                DeviceInstanceId(devInfoData.DevInst), DeviceInstanceId(parent) });
++        }
++        catch (...) {
++            SetupDiDestroyDeviceInfoList(deviceInfoSet);
++            throw;
++        }
+     }
+ 
+     SetupDiDestroyDeviceInfoList(deviceInfoSet);
+@@ -834,37 +863,60 @@ bool FindBulkOutPipe(
+     return false;
+ }
+ 
+-WinUsbNcmDevice WinUsbNcmDevice::OpenFirst()
++static NcmInterfacePair EnumerateTargetPair()
+ {
+     std::wcout << L"Control GUID: " << GuidToString(kControlInterfaceGuid) << L"\n";
+     std::wcout << L"Data GUID   : " << GuidToString(kDataInterfaceGuid) << L"\n";
++    const auto controls = EnumerateDevicePaths(kControlInterfaceGuid);
++    const auto data = EnumerateDevicePaths(kDataInterfaceGuid);
++    const auto printCandidates = [](const wchar_t* role, const auto& candidates) {
++        std::wcout << L"\n" << role << L" paths: " << candidates.size() << L"\n";
++        for (const auto& candidate : candidates) {
++            std::wcout << L"  " << candidate.path << L"\n"
++                << L"    instance: " << candidate.instanceId << L"\n"
++                << L"    parent  : " << candidate.parentInstanceId << L"\n";
++        }
++    };
++    printCandidates(L"Control", controls);
++    printCandidates(L"Data", data);
++    auto pair = SelectTargetNcmPair(controls, data);
++    std::wcout << L"\nSelected Apple 05AC:1905 composite device: "
++        << pair.control.parentInstanceId << L"\n";
++    return pair;
++}
+ 
+-    auto controlPaths = EnumerateDevicePaths(kControlInterfaceGuid);
+-    auto dataPaths = EnumerateDevicePaths(kDataInterfaceGuid);
+-
+-    std::wcout << L"\n=== Device interface paths ===\n";
+-    std::wcout << L"Control paths: " << controlPaths.size() << L"\n";
+-    for (const auto& path : controlPaths) {
+-        std::wcout << L"  " << path << L"\n";
+-    }
+-    std::wcout << L"Data paths   : " << dataPaths.size() << L"\n";
+-    for (const auto& path : dataPaths) {
+-        std::wcout << L"  " << path << L"\n";
+-    }
++void WinUsbNcmDevice::ListDevices()
++{
++    EnumerateTargetPair();
++    std::wcout << L"Matching control/data pair found. No USB handles opened or settings changed.\n";
++}
+ 
+-    if (controlPaths.empty()) {
+-        throw std::runtime_error("No control WinUSB device interface found");
++static void ValidateTargetInterface(WinUsbDevice& device, UCHAR interfaceNumber)
++{
++    USB_DEVICE_DESCRIPTOR descriptor = {};
++    ULONG transferred = 0;
++    if (!WinUsb_GetDescriptor(device.winusb, USB_DEVICE_DESCRIPTOR_TYPE, 0, 0,
++            reinterpret_cast<PUCHAR>(&descriptor), sizeof(descriptor), &transferred)) {
++        ThrowLastError("WinUsb_GetDescriptor(target identity)");
+     }
+-    if (dataPaths.empty()) {
+-        throw std::runtime_error("No data WinUSB device interface found");
++    if (transferred != sizeof(descriptor) || descriptor.idVendor != 0x05ac || descriptor.idProduct != 0x1905) {
++        throw std::runtime_error("Opened USB device is not Apple 05AC:1905; refusing to configure it.");
+     }
+-    if (controlPaths.size() > 1 || dataPaths.size() > 1) {
+-        std::wcout << L"\nWarning: multiple paths found; using the first control and first data path.\n";
++    USB_INTERFACE_DESCRIPTOR interfaceDescriptor = {};
++    if (!QueryInterfaceDescriptor(device.winusb, 0, interfaceDescriptor) ||
++        interfaceDescriptor.bInterfaceNumber != interfaceNumber) {
++        throw std::runtime_error("Opened WinUSB interface does not match the expected MI_00/MI_01 role.");
+     }
++}
+ 
++WinUsbNcmDevice WinUsbNcmDevice::OpenTarget()
++{
++    const auto pair = EnumerateTargetPair();
+     WinUsbNcmDevice device;
+-    device.control_ = OpenWinUsbDevice(L"control", controlPaths.front());
+-    device.data_ = OpenWinUsbDevice(L"data", dataPaths.front());
++    device.control_ = OpenWinUsbDevice(L"control", pair.control.path);
++    device.data_ = OpenWinUsbDevice(L"data", pair.data.path);
++    ValidateTargetInterface(device.control_, 0);
++    ValidateTargetInterface(device.data_, 1);
+     return device;
+ }
+ 
+@@ -889,7 +941,7 @@ bool WinUsbNcmDevice::TryReopenAndConfigure(const Options& options, DWORD& error
+ {
+     error = ERROR_SUCCESS;
+     try {
+-        WinUsbNcmDevice reopened = WinUsbNcmDevice::OpenFirst();
++        WinUsbNcmDevice reopened = WinUsbNcmDevice::OpenTarget();
+         reopened.InspectAndConfigure(options);
+ 
+         control_ = std::move(reopened.control_);
+diff --git a/usermode-probe/winusb_session.h b/usermode-probe/winusb_session.h
+index 0604452..691a652 100644
+--- a/usermode-probe/winusb_session.h
++++ b/usermode-probe/winusb_session.h
+@@ -16,7 +16,8 @@ bool FindBulkOutPipe(
+ 
+ class WinUsbNcmDevice {
+ public:
+-    static WinUsbNcmDevice OpenFirst();
++    static WinUsbNcmDevice OpenTarget();
++    static void ListDevices();
+ 
+     void InspectAndConfigure(const Options& options);
+     void RunRequestedActions(const Options& options);
